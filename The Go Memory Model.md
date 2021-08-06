@@ -182,3 +182,158 @@ func main() {
 sync包提供了两种锁类型，sync.Mutex和sync.RWMutex。
 
 *对任意sync.Mutext或sync.RWMutex类型的变量l，且n<m，对l.Unlock()的n次调用先行发生于对l.Lock()的m次调用返回之前。*
+
+来看下：
+
+```go
+var l sync.Mutex
+var a string
+
+func f() {
+	a = "hello, world"
+	l.Unlock()
+}
+
+func main() {
+	l.Lock()
+	go f()
+	l.Lock()
+	print(a)
+}
+```
+
+它能够确保打印出“hello,world”。第一次调用l.Unlock()（在f里）先行发生于第二次调用l.Lock()（在main里）返回之前，而它又继续先行发生于print。
+
+*对sync.RWMutex类型的变量l的任意次调用l.RLock，都存在一个n，l.RLock的返回后行发生于l.Unlock的n次调用，并且l.RUnlock先行发生于n+1次l.Lock调用。*
+
+### Once
+
+sync包提供了一个Once类型，它可以在多个Go协程出现的时候提供安全的初始化机制。对于特定的f，多个线程都可以执行once.Do(f)，但只有一个可以真正运行f()，其他的调用会被一直阻塞直到f()返回。
+
+*通过once.Do(f)对f进行的一次调用先行发生（返回）于任意once.Do(f)的返回。*
+
+看下面：
+
+```go
+var a string
+var once sync.Once
+
+func setup() {
+	a = "hello, world"
+}
+
+func doprint() {
+	once.Do(setup)
+	print(a)
+}
+
+func twoprint() {
+	go doprint()
+	go doprint()
+}
+```
+
+调用twoprint只会调用一次setup。setup函数会在print调用之前完成。结果就是打印了两遍“hello,world”。
+
+## 错误的同步
+
+值得注意的是，一次读操作r可能会观察到与*r*并发的写操作*w*写入的值。但即便出现这种情况，并不意味之*r*之后发生的读操作会观察到*w*之前发生的写操作。
+
+来看下：
+
+```go
+var a, b int
+
+func f() {
+	a = 1
+	b = 2
+}
+
+func g() {
+	print(b)
+	print(a)
+}
+
+func main() {
+	go f()
+	g()
+}
+```
+
+可能出现的情况是g打印出2和0。
+
+这样就打破了一些常用的套路。
+
+双重检查锁定常用于减少同步带来的损耗。比如twoprint可能被错误地写成这样：
+
+```go
+var a string
+var done bool
+
+func setup() {
+	a = "hello, world"
+	done = true
+}
+
+func doprint() {
+	if !done {
+		once.Do(setup)
+	}
+	print(a)
+}
+
+func twoprint() {
+	go doprint()
+	go doprint()
+}
+```
+
+但这样无法保证在doprint中观察到done的写入就一定意味着观察到了a的写入。这个版本可能会（错误地）打印出一个空字符串而非“hello,world”。
+
+另一个错误的用法是繁忙等待（busy waiting），比如：
+
+```go
+var a string
+var done bool
+
+func setup() {
+	a = "hello, world"
+	done = true
+}
+
+func main() {
+	go setup()
+	for !done {
+	}
+	print(a)
+}
+```
+
+同样，无法保证在main中观察到对done的写入时也能观察到对a的写入，所以这个程序可能打印的也是空字符串。更糟糕的是，main可能永远也无法观察到done的写入，因为两个线程之间不存在同步事件。main中的循环可能永不止步。
+
+关于这个事儿，我们再看一个不一样的。
+
+```go
+type T struct {
+	msg string
+}
+
+var g *T
+
+func setup() {
+	t := new(T)
+	t.msg = "hello, world"
+	g = t
+}
+
+func main() {
+	go setup()
+	for g == nil {
+	}
+	print(g.msg)
+}
+```
+
+即便main观察到了g!=nil并且退出了循环，仍然无法保证它观察到了g.msg的初始值。
+
+对于所有这些问题，解决之道都是一样的：显式同步。
